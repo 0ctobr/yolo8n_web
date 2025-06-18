@@ -1,277 +1,304 @@
-// ===== 1. КОНФИГУРАЦИЯ =====
-const INPUT_SIZE = 640;
-const CONFIDENCE_THRESHOLD = 0.5;
-const IOU_THRESHOLD = 0.45; // Порог для Non-Maximum Suppression
-
-let session = null;
-let classes = [];
-
-// DOM-элементы
-const elements = {
-    imageUpload: document.getElementById('imageUpload'),
-    preview: document.getElementById('preview'),
-    canvas: document.getElementById('canvas'),
-    results: document.getElementById('results'),
-    loading: document.getElementById('loading')
-};
-
-// ===== 2. ИНИЦИАЛИЗАЦИЯ МОДЕЛИ =====
-async function init() {
-    try {
-        elements.loading.style.display = 'block';
-        elements.loading.textContent = 'Инициализация WASM...';
-        
-        await ort.env.wasm.wasmReady;
-        ort.env.wasm.numThreads = 1;
-
-        // Загрузка классов COCO
-        const classesResponse = await fetch('coco_classes.json');
-        if (!classesResponse.ok) throw new Error('Ошибка загрузки классов');
-        classes = await classesResponse.json();
-
-        // Загрузка модели YOLOv8
-        elements.loading.textContent = 'Загрузка модели YOLOv8...';
-        session = await ort.InferenceSession.create('model/yolov8n.onnx', {
-            executionProviders: ['wasm'],
-            graphOptimizationLevel: 'all'
-        });
-
-        elements.loading.style.display = 'none';
-    } catch (err) {
-        console.error('Ошибка инициализации:', err);
-        elements.loading.innerHTML = `<div class="error">${err.message}</div>`;
-    }
-}
-
-// ===== 3. ОБРАБОТКА ИЗОБРАЖЕНИЙ =====
-elements.imageUpload.addEventListener('change', handleImageUpload);
-
-async function handleImageUpload(event) {
-    if (!session) {
-        alert('Модель не загружена!');
-        return;
-    }
-
-    const file = event.target.files[0];
-    if (!file) return;
-
-    const image = new Image();
-    image.src = URL.createObjectURL(file);
-
-    image.onload = async () => {
-        elements.preview.src = image.src;
-        elements.canvas.width = image.width;
-        elements.canvas.height = image.height;
-        elements.results.innerHTML = '';
-        
-        elements.loading.style.display = 'block';
-        elements.loading.textContent = 'Анализ изображения...';
-
+document.addEventListener('DOMContentLoaded', async () => {
+    // DOM элементы
+    const imageUpload = document.getElementById('imageUpload');
+    const preview = document.getElementById('preview');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const loading = document.getElementById('loading');
+    const resultsDiv = document.getElementById('results');
+    
+    let session = null;
+    let classes = null;
+    let isModelReady = false;
+    
+    // Инициализация модели и классов
+    async function init() {
+        showLoading(true, "Initializing WASM runtime...");
         try {
-            // 3.1 Препроцессинг изображения
-            const { tensor, scale, pad } = preprocessImage(image);
-            const input = new ort.Tensor('float32', tensor, [1, 3, INPUT_SIZE, INPUT_SIZE]);
-
-            // 3.2 Выполнение предсказания
-            const outputs = await session.run({ images: input });
-            const outputTensor = outputs.output0; // Важно: имя выхода 'output0' для YOLOv8
+            // Инициализация ONNX Runtime
+            await ort.init();
             
-            // 3.3 Постобработка результатов
-            const detections = processOutput(
-                outputTensor.data, 
-                image.width, 
-                image.height, 
-                scale, 
-                pad
+            // Загрузка классов COCO
+            const response = await fetch('coco_classes.json');
+            classes = await response.json();
+            
+            // Загрузка модели YOLOv8n
+            showLoading(true, "Loading YOLOv8n model...");
+            session = await ort.InferenceSession.create(
+                './model/yolov8n.onnx', 
+                { executionProviders: ['wasm'] }
             );
             
-            renderDetections(detections);
-            displayResults(detections);
-        } catch (err) {
-            console.error('Ошибка обработки:', err);
-            elements.results.innerHTML = `<div class="error">${err.message}</div>`;
-        } finally {
-            elements.loading.style.display = 'none';
+            isModelReady = true;
+            showLoading(false);
+            console.log("Model and WASM runtime initialized");
+        } catch (error) {
+            console.error("Initialization failed:", error);
+            showLoading(false, `Error: ${error.message}`);
         }
-    };
-}
-
-// 3.1 Препроцессинг изображения
-function preprocessImage(img) {
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
-    canvas.width = INPUT_SIZE;
-    canvas.height = INPUT_SIZE;
-
-    // Масштабирование с сохранением пропорций
-    const scale = Math.min(INPUT_SIZE / img.width, INPUT_SIZE / img.height);
-    const newWidth = img.width * scale;
-    const newHeight = img.height * scale;
-    const xOffset = (INPUT_SIZE - newWidth) / 2;
-    const yOffset = (INPUT_SIZE - newHeight) / 2;
-
-    // Рисуем изображение с паддингом
-    ctx.fillStyle = '#000000';
-    ctx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
-    ctx.drawImage(img, xOffset, yOffset, newWidth, newHeight);
-
-    // Нормализация данных [0-255] -> [0-1]
-    const imageData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE);
-    const data = imageData.data;
-    const tensor = new Float32Array(3 * INPUT_SIZE * INPUT_SIZE);
-
-    for (let i = 0; i < data.length; i += 4) {
-        const idx = i / 4;
-        tensor[idx] = data[i] / 255.0;         // R
-        tensor[idx + INPUT_SIZE * INPUT_SIZE] = data[i + 1] / 255.0; // G
-        tensor[idx + 2 * INPUT_SIZE * INPUT_SIZE] = data[i + 2] / 255.0; // B
     }
 
-    return {
-        tensor: tensor,
-        scale: scale,
-        pad: { x: xOffset, y: yOffset }
-    };
-}
+    // Показать/скрыть загрузку
+    function showLoading(show, message = "Processing...") {
+        loading.textContent = message;
+        loading.style.display = show ? 'block' : 'none';
+    }
 
-// ===== 4. ОБРАБОТКА ВЫХОДА МОДЕЛИ =====
-function processOutput(predictions, origWidth, origHeight, scale, pad) {
-    const detections = [];
-    const numClasses = classes.length;
-    const gridSize = 8400; // 80*80 + 40*40 + 20*20 = 8400 для YOLOv8
-    
-    // 4.1 Парсинг выходного тензора формата [1, 84, 8400]
-    for (let i = 0; i < gridSize; i++) {
-        const startIdx = i * (4 + numClasses);
-        const cx = predictions[startIdx] * INPUT_SIZE;     // center x
-        const cy = predictions[startIdx + 1] * INPUT_SIZE; // center y
-        const w = predictions[startIdx + 2] * INPUT_SIZE;  // width
-        const h = predictions[startIdx + 3] * INPUT_SIZE;   // height
+    // Обработка загрузки изображения
+    imageUpload.addEventListener('change', async (e) => {
+        if (!e.target.files || !e.target.files[0]) return;
         
-        // 4.2 Поиск класса с максимальной уверенностью
-        let maxConfidence = 0;
-        let classId = 0;
-        for (let c = 0; c < numClasses; c++) {
-            const confidence = predictions[startIdx + 4 + c];
-            if (confidence > maxConfidence) {
-                maxConfidence = confidence;
-                classId = c;
+        const file = e.target.files[0];
+        const reader = new FileReader();
+        
+        reader.onload = async (event) => {
+            // Отображаем превью
+            preview.src = event.target.result;
+            
+            preview.onload = async () => {
+                if (!isModelReady) {
+                    showLoading(true, "Model not ready, initializing...");
+                    await init();
+                }
+                
+                try {
+                    showLoading(true, "Detecting objects...");
+                    
+                    // Обработка изображения
+                    const { inputTensor, xRatio, yRatio } = preprocessImage(preview);
+                    
+                    // Выполнение вывода
+                    const output = await runInference(inputTensor);
+                    
+                    // Обработка результатов
+                    const detections = processOutput(output, preview, xRatio, yRatio);
+                    
+                    // Отрисовка результатов
+                    drawDetections(detections);
+                    displayResults(detections);
+                    
+                    showLoading(false);
+                } catch (error) {
+                    console.error("Detection error:", error);
+                    showLoading(false, `Detection failed: ${error.message}`);
+                }
+            };
+        };
+        
+        reader.readAsDataURL(file);
+    });
+
+    // Предварительная обработка изображения
+    function preprocessImage(img) {
+        const modelSize = 640;
+        const channels = 3;
+        
+        // Рассчитываем соотношения сторон
+        const xRatio = img.width / modelSize;
+        const yRatio = img.height / modelSize;
+        
+        // Создаем временный canvas для ресайза
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = modelSize;
+        tempCanvas.height = modelSize;
+        const tempCtx = tempCanvas.getContext('2d');
+        
+        // Рисуем изображение с сохранением пропорций
+        tempCtx.fillStyle = '#121212'; // Цвет фона
+        tempCtx.fillRect(0, 0, modelSize, modelSize);
+        
+        const scale = Math.min(modelSize / img.width, modelSize / img.height);
+        const newWidth = img.width * scale;
+        const newHeight = img.height * scale;
+        const xOffset = (modelSize - newWidth) / 2;
+        const yOffset = (modelSize - newHeight) / 2;
+        
+        tempCtx.drawImage(
+            img, 
+            0, 0, img.width, img.height,
+            xOffset, yOffset, newWidth, newHeight
+        );
+        
+        // Получаем данные изображения
+        const imageData = tempCtx.getImageData(0, 0, modelSize, modelSize);
+        
+        // Преобразуем в тензор (нормализация 0-1, формат CHW)
+        const inputData = new Float32Array(channels * modelSize * modelSize);
+        for (let i = 0; i < imageData.data.length; i += 4) {
+            const pixelIndex = i / 4;
+            inputData[pixelIndex] = imageData.data[i] / 255;       // R
+            inputData[pixelIndex + modelSize * modelSize] = imageData.data[i + 1] / 255; // G
+            inputData[pixelIndex + 2 * modelSize * modelSize] = imageData.data[i + 2] / 255; // B
+        }
+        
+        return {
+            inputTensor: new ort.Tensor('float32', inputData, [1, channels, modelSize, modelSize]),
+            xRatio,
+            yRatio
+        };
+    }
+
+    // Выполнение вывода модели
+    async function runInference(inputTensor) {
+        const feeds = { 
+            images: inputTensor 
+        };
+        
+        const results = await session.run(feeds);
+        return results.output0.data;
+    }
+
+    // Обработка выходных данных модели
+    function processOutput(output, img, xRatio, yRatio) {
+        const detections = [];
+        const outputSize = 84; // 4 bbox + 80 classes
+        const numDetections = output.length / outputSize;
+        
+        for (let i = 0; i < numDetections; i++) {
+            const offset = i * outputSize;
+            
+            // Извлекаем параметры bbox
+            const xc = output[offset];
+            const yc = output[offset + 1];
+            const w = output[offset + 2];
+            const h = output[offset + 3];
+            
+            // Рассчитываем координаты
+            const x1 = (xc - w / 2) * xRatio;
+            const y1 = (yc - h / 2) * yRatio;
+            const x2 = (xc + w / 2) * xRatio;
+            const y2 = (yc + h / 2) * yRatio;
+            const width = x2 - x1;
+            const height = y2 - y1;
+            
+            // Находим класс с максимальной уверенностью
+            let maxProb = -1;
+            let classId = -1;
+            for (let j = 4; j < 84; j++) {
+                const prob = output[offset + j];
+                if (prob > maxProb) {
+                    maxProb = prob;
+                    classId = j - 4;
+                }
+            }
+            
+            // Применяем сигмоиду для получения вероятности
+            const confidence = 1 / (1 + Math.exp(-maxProb));
+            
+            if (confidence > 0.5 && classId in classes) {
+                detections.push({
+                    bbox: [x1, y1, width, height],
+                    classId,
+                    className: classes[classId],
+                    confidence,
+                    color: `hsl(${(classId * 137) % 360}, 80%, 60%)`
+                });
             }
         }
         
-        if (maxConfidence < CONFIDENCE_THRESHOLD) continue;
+        // Применяем Non-Maximum Suppression (NMS)
+        return applyNMS(detections, 0.45);
+    }
+
+    // Non-Maximum Suppression
+    function applyNMS(detections, iouThreshold) {
+        detections.sort((a, b) => b.confidence - a.confidence);
         
-        // 4.3 Преобразование координат (центр -> углы)
-        const x1 = (cx - w / 2 - pad.x) / scale;
-        const y1 = (cy - h / 2 - pad.y) / scale;
-        const x2 = (cx + w / 2 - pad.x) / scale;
-        const y2 = (cy + h / 2 - pad.y) / scale;
+        const finalDetections = [];
+        while (detections.length > 0) {
+            const current = detections.shift();
+            finalDetections.push(current);
+            
+            for (let i = detections.length - 1; i >= 0; i--) {
+                if (current.classId !== detections[i].classId) continue;
+                
+                const iou = calculateIOU(current.bbox, detections[i].bbox);
+                if (iou > iouThreshold) {
+                    detections.splice(i, 1);
+                }
+            }
+        }
         
-        // 4.4 Фильтрация выходящих за границы координат
-        const bbox = [
-            Math.max(0, x1),
-            Math.max(0, y1),
-            Math.min(origWidth, x2) - Math.max(0, x1),
-            Math.min(origHeight, y2) - Math.max(0, y1)
-        ];
+        return finalDetections;
+    }
+
+    // Расчет Intersection over Union (IoU)
+    function calculateIOU(box1, box2) {
+        const [x1, y1, w1, h1] = box1;
+        const [x2, y2, w2, h2] = box2;
         
-        detections.push({
-            classId,
-            className: classes[classId],
-            confidence: maxConfidence,
-            bbox: bbox
+        const interX1 = Math.max(x1, x2);
+        const interY1 = Math.max(y1, y2);
+        const interX2 = Math.min(x1 + w1, x2 + w2);
+        const interY2 = Math.min(y1 + h1, y2 + h2);
+        
+        const interArea = Math.max(0, interX2 - interX1) * Math.max(0, interY2 - interY1);
+        const box1Area = w1 * h1;
+        const box2Area = w2 * h2;
+        
+        return interArea / (box1Area + box2Area - interArea);
+    }
+
+    // Отрисовка обнаруженных объектов
+    function drawDetections(detections) {
+        // Настройка canvas
+        canvas.width = preview.width;
+        canvas.height = preview.height;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        // Рисуем каждый обнаруженный объект
+        detections.forEach(det => {
+            const [x, y, width, height] = det.bbox;
+            
+            // Рисуем bounding box
+            ctx.strokeStyle = det.color;
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x, y, width, height);
+            
+            // Рисуем фон для текста
+            ctx.fillStyle = det.color;
+            const text = `${det.className} ${(det.confidence * 100).toFixed(1)}%`;
+            const textWidth = ctx.measureText(text).width;
+            
+            ctx.fillRect(
+                x - 1,
+                y - 20,
+                textWidth + 10,
+                20
+            );
+            
+            // Рисуем текст
+            ctx.fillStyle = 'white';
+            ctx.font = '14px Arial';
+            ctx.textBaseline = 'top';
+            ctx.fillText(text, x + 4, y - 18);
         });
     }
-    
-    // 4.5 Применение Non-Maximum Suppression
-    return nms(detections);
-}
 
-// 4.5 Алгоритм Non-Maximum Suppression
-function nms(detections) {
-    const sortedDetections = [...detections].sort((a, b) => b.confidence - a.confidence);
-    const selected = [];
-    
-    while (sortedDetections.length > 0) {
-        const current = sortedDetections.shift();
-        selected.push(current);
+    // Отображение результатов в виде списка
+    function displayResults(detections) {
+        resultsDiv.innerHTML = '';
         
-        for (let i = sortedDetections.length - 1; i >= 0; i--) {
-            const iou = calculateIOU(current.bbox, sortedDetections[i].bbox);
-            if (iou > IOU_THRESHOLD) {
-                sortedDetections.splice(i, 1);
-            }
+        if (detections.length === 0) {
+            resultsDiv.innerHTML = '<div class="detection-item">No objects detected</div>';
+            return;
         }
-    }
-    
-    return selected;
-}
-
-// Расчет Intersection over Union
-function calculateIOU(box1, box2) {
-    const [x1, y1, w1, h1] = box1;
-    const [x2, y2, w2, h2] = box2;
-    
-    const interX1 = Math.max(x1, x2);
-    const interY1 = Math.max(y1, y2);
-    const interX2 = Math.min(x1 + w1, x2 + w2);
-    const interY2 = Math.min(y1 + h1, y2 + h2);
-    
-    const interArea = Math.max(0, interX2 - interX1) * Math.max(0, interY2 - interY1);
-    const box1Area = w1 * h1;
-    const box2Area = w2 * h2;
-    
-    return interArea / (box1Area + box2Area - interArea);
-}
-
-// ===== 5. ВИЗУАЛИЗАЦИЯ РЕЗУЛЬТАТОВ =====
-function renderDetections(detections) {
-    const ctx = elements.canvas.getContext('2d');
-    ctx.clearRect(0, 0, elements.canvas.width, elements.canvas.height);
-    
-    detections.forEach(det => {
-        const [x, y, w, h] = det.bbox;
-        const color = getColorForClass(det.classId);
         
-        // Рисуем bounding box
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 2;
-        ctx.strokeRect(x, y, w, h);
-        
-        // Рисуем фон для текста
-        const label = `${det.className} ${(det.confidence * 100).toFixed(1)}%`;
-        ctx.fillStyle = color;
-        ctx.fillRect(x, y - 18, ctx.measureText(label).width + 10, 18);
-        
-        // Рисуем текст
-        ctx.fillStyle = 'white';
-        ctx.font = '14px Arial';
-        ctx.fillText(label, x + 5, y - 3);
-    });
-}
-
-function displayResults(detections) {
-    elements.results.innerHTML = detections.length === 0
-        ? '<div class="detection-item">Объекты не обнаружены</div>'
-        : detections.map(det => {
-            const [x, y, w, h] = det.bbox;
-            const color = getColorForClass(det.classId);
+        detections.forEach(det => {
+            const item = document.createElement('div');
+            item.className = 'detection-item';
             
-            return `
-            <div class="detection-item">
-                <div class="detection-color" style="background: ${color}"></div>
+            item.innerHTML = `
+                <div class="detection-color" style="background-color: ${det.color}"></div>
                 <div class="detection-info">
-                    <strong>${det.className}</strong> (${(det.confidence * 100).toFixed(1)}%)
-                    <div>X: ${x.toFixed(0)}, Y: ${y.toFixed(0)}, Ш: ${w.toFixed(0)}, В: ${h.toFixed(0)}</div>
+                    ${det.className} - ${(det.confidence * 100).toFixed(1)}%
                 </div>
-            </div>`;
-        }).join('');
-}
+            `;
+            
+            resultsDiv.appendChild(item);
+        });
+    }
 
-function getColorForClass(classId) {
-    const hue = (classId * 137.508) % 360; // Золотой угол для разнообразия цветов
-    return `hsl(${hue}, 90%, 50%)`;
-}
-
-// Инициализация при загрузке страницы
-document.addEventListener('DOMContentLoaded', init);
+    // Инициализация при загрузке страницы
+    init();
+});
