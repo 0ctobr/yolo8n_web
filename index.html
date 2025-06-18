@@ -2,17 +2,17 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>YOLOv8n Object Detection</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+    <title>YOLOv8n WASM Object Detection</title>
     <link rel="stylesheet" href="style.css">
-    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js"></script>
 </head>
 <body>
     <div class="container">
-        <h1>YOLOv8n Object Detection</h1>
+        <h1>YOLOv8n Object Detection (WASM)</h1>
         <div class="upload-container">
             <input type="file" id="imageUpload" accept="image/*">
-            <div class="loading" id="loading">Loading model...</div>
+            <div class="loading" id="loading">Initializing WASM runtime...</div>
         </div>
         <div class="image-container">
             <img id="preview">

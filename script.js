@@ -17,28 +17,45 @@ const elements = {
     loading: document.getElementById('loading')
 };
 
-// Инициализация приложения
+// Инициализация приложения (WASM-специфичная)
 async function init() {
     try {
-        // Показать индикатор загрузки
         elements.loading.style.display = 'block';
+        elements.loading.textContent = 'Initializing WASM runtime...';
+        
+        // Инициализация WASM-рантайма
+        await ort.env.wasm.wasmReady;
+        elements.loading.textContent = 'WASM runtime ready, loading classes...';
         
         // Загрузка классов COCO
-        const response = await fetch('coco_classes.json');
-        classes = await response.json();
+        const classesResponse = await fetch('coco_classes.json');
+        if (!classesResponse.ok) throw new Error('Failed to load COCO classes');
+        classes = await classesResponse.json();
         
-        // Загрузка модели ONNX
-        session = await ort.InferenceSession.create('./model/yolov8n.onnx', {
-            executionProviders: ['webgl'] // Используем WebGL для ускорения
+        elements.loading.textContent = 'Loading YOLOv8 model (WASM)...';
+        
+        // Загрузка модели с использованием WASM
+        const modelPath = 'model/yolov8n.onnx';
+        session = await ort.InferenceSession.create(modelPath, {
+            executionProviders: ['wasm'],
+            graphOptimizationLevel: 'all'
         });
         
-        // Скрыть индикатор загрузки
         elements.loading.style.display = 'none';
-        
-        console.log('Model and classes loaded successfully');
+        console.log('Model loaded with WASM backend');
     } catch (error) {
-        console.error('Initialization error:', error);
-        elements.loading.textContent = 'Error loading model. See console for details.';
+        console.error('WASM initialization error:', error);
+        elements.loading.innerHTML = `
+            <div class="error">WASM Error: ${error.message}</div>
+            <div>Common WASM solutions:
+                <ul>
+                    <li>Ensure browser supports WebAssembly</li>
+                    <li>Check memory limits (Chrome: chrome://flags/#enable-webassembly)</li>
+                    <li>Verify model size matches expectations (~12MB)</li>
+                    <li>Try Firefox if Chrome has issues</li>
+                </ul>
+            </div>
+        `;
     }
 }
 
@@ -47,7 +64,7 @@ elements.imageUpload.addEventListener('change', handleImageUpload);
 
 async function handleImageUpload(event) {
     if (!session) {
-        alert('Model is still loading. Please wait...');
+        alert('WASM model is still loading. Please wait...');
         return;
     }
     
@@ -63,14 +80,18 @@ async function handleImageUpload(event) {
         
         // Очистить предыдущие результаты
         elements.results.innerHTML = '';
+        const ctx = elements.canvas.getContext('2d');
+        ctx.clearRect(0, 0, elements.canvas.width, elements.canvas.height);
         
         // Показать индикатор обработки
-        elements.loading.textContent = 'Processing image...';
+        elements.loading.textContent = 'Processing image (WASM)...';
         elements.loading.style.display = 'block';
         
         try {
-            // Препроцессинг и запуск модели
+            // Препроцессинг изображения
             const tensor = preprocessImage(image);
+            
+            // Запуск модели через WASM
             const input = new ort.Tensor('float32', tensor, [1, 3, INPUT_SIZE, INPUT_SIZE]);
             const outputs = await session.run({ images: input });
             const predictions = outputs.output0.data;
@@ -82,8 +103,8 @@ async function handleImageUpload(event) {
             renderDetections(detections);
             displayResults(detections);
         } catch (error) {
-            console.error('Detection error:', error);
-            elements.results.innerHTML = `<div class="error">Error: ${error.message}</div>`;
+            console.error('WASM processing error:', error);
+            elements.results.innerHTML = `<div class="error">Processing Error: ${error.message}</div>`;
         } finally {
             // Скрыть индикатор обработки
             elements.loading.style.display = 'none';

@@ -119,3 +119,28 @@ input[type="file"]:hover {
         font-size: 24px;
     }
 }
+
+.wasm-notice {
+    text-align: center;
+    padding: 10px;
+    background: #e6f7ff;
+    border-radius: 5px;
+    border-left: 4px solid #1890ff;
+    margin-top: 15px;
+    font-size: 14px;
+}
+
+@media (max-width: 480px) {
+    .container {
+        padding: 10px;
+    }
+    
+    h1 {
+        font-size: 20px;
+    }
+    
+    input[type="file"] {
+        width: 100%;
+        box-sizing: border-box;
+    }
+}
