@@ -18,7 +18,7 @@ const colors = [
 async function init() {
     try {
         showLoading(true, "Loading ONNX Runtime and model...");
-        await ort.env.wasm.init();
+        //await ort.env.wasm.init();
         isWasmLoaded = true;
         
         showLoading(true, "Loading YOLOv8n model...");
