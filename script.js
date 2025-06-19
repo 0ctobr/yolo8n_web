@@ -1,304 +1,275 @@
-document.addEventListener('DOMContentLoaded', async () => {
-    // DOM элементы
-    const imageUpload = document.getElementById('imageUpload');
+document.addEventListener('DOMContentLoaded', init);
+
+// Глобальные переменные
+let session = null;
+let classNames = [];
+let isWasmLoaded = false;
+const inputSize = 640;
+
+// Цвета для разных классов
+const colors = [
+    '#FF3838', '#FF9D97', '#FF701F', '#FFB21D', '#CFD231', '#48F90A',
+    '#92CC17', '#3DDB86', '#1A9334', '#00D4BB', '#2C99A8', '#00C2FF',
+    '#344593', '#6473FF', '#0018EC', '#8438FF', '#520085', '#CB38FF',
+    '#FF95C8', '#FF37C7'
+];
+
+// Инициализация приложения
+async function init() {
+    try {
+        showLoading(true, "Loading ONNX Runtime and model...");
+        await ort.env.wasm.init();
+        isWasmLoaded = true;
+        
+        showLoading(true, "Loading YOLOv8n model...");
+        session = await ort.InferenceSession.create(
+            './model/yolov8n.onnx', 
+            { executionProviders: ['wasm'] }
+        );
+        
+        const response = await fetch('coco_classes.json');
+        classNames = await response.json();
+        
+        showLoading(false);
+        document.getElementById('imageUpload').disabled = false;
+        console.log("Model and runtime initialized successfully");
+    } catch (error) {
+        console.error("Initialization failed:", error);
+        showLoading(false);
+        alert(`Initialization failed: ${error.message}`);
+    }
+}
+
+function showLoading(show, message = "Processing...") {
+    const loading = document.getElementById('loading');
+    if (show) {
+        loading.textContent = message;
+        loading.style.display = 'block';
+    } else {
+        loading.style.display = 'none';
+    }
+}
+
+// Обработка загрузки изображения
+document.getElementById('imageUpload').addEventListener('change', async function(e) {
+    if (!session) return alert("Model not loaded yet");
+    if (!e.target.files || e.target.files.length === 0) return;
+    
+    const file = e.target.files[0];
+    const image = new Image();
+    const reader = new FileReader();
+    
+    reader.onload = async function(event) {
+        try {
+            showLoading(true, "Processing image...");
+            image.src = event.target.result;
+            
+            image.onload = async function() {
+                const preview = document.getElementById('preview');
+                preview.src = image.src;
+                await new Promise(resolve => setTimeout(resolve, 50));
+                await detectObjects(image);
+            };
+        } catch (error) {
+            console.error("Image processing error:", error);
+            alert(`Error: ${error.message}`);
+            showLoading(false);
+        }
+    };
+    reader.readAsDataURL(file);
+});
+
+async function detectObjects(image) {
+    try {
+        const { tensor, padding } = preprocessImage(image);
+        
+        showLoading(true, "Running object detection...");
+        const startTime = performance.now();
+        const outputs = await session.run({ images: tensor });
+        const endTime = performance.now();
+        console.log(`Inference time: ${(endTime - startTime).toFixed(1)}ms`);
+        
+        // Передаем image для преобразования координат
+        const detections = processOutput(outputs, padding, image);
+        
+        drawResults(detections, image);
+        showResults(detections, endTime - startTime);
+    } catch (error) {
+        console.error("Detection error:", error);
+        alert(`Detection failed: ${error.message}`);
+    } finally {
+        showLoading(false);
+    }
+}
+
+function preprocessImage(image) {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = inputSize;
+    canvas.height = inputSize;
+    
+    const scale = Math.min(
+        inputSize / image.naturalWidth,
+        inputSize / image.naturalHeight
+    );
+    
+    const newWidth = image.naturalWidth * scale;
+    const newHeight = image.naturalHeight * scale;
+    const padX = (inputSize - newWidth) / 2;
+    const padY = (inputSize - newHeight) / 2;
+    
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, inputSize, inputSize);
+    ctx.drawImage(image, padX, padY, newWidth, newHeight);
+    
+    const imageData = ctx.getImageData(0, 0, inputSize, inputSize);
+    const tensorData = new Float32Array(3 * inputSize * inputSize);
+    
+    for (let i = 0; i < imageData.data.length; i += 4) {
+        const idx = i / 4;
+        tensorData[idx] = imageData.data[i] / 255;
+        tensorData[idx + inputSize * inputSize] = imageData.data[i + 1] / 255;
+        tensorData[idx + 2 * inputSize * inputSize] = imageData.data[i + 2] / 255;
+    }
+    
+    return {
+        tensor: new ort.Tensor('float32', tensorData, [1, 3, inputSize, inputSize]),
+        padding: { x: padX, y: padY, scale }
+    };
+}
+
+// Обработка вывода модели для nms=True
+function processOutput(outputs, padding, image) {
+    const output = outputs.output0.data;
+    const dims = outputs.output0.dims;
+    const detections = [];
+    
+    // Проверяем формат вывода (для nms=True)
+    if (dims.length === 3 && dims[2] === 6) {
+        // Формат [1, num_detections, 6]
+        const numDetections = dims[1];
+        
+        for (let i = 0; i < numDetections; i++) {
+            const offset = i * 6;
+            const confidence = output[offset + 4];
+            const classId = output[offset + 5];
+            
+            if (confidence > 0.5) {
+                const x1 = output[offset];
+                const y1 = output[offset + 1];
+                const x2 = output[offset + 2];
+                const y2 = output[offset + 3];
+                
+                // Преобразуем координаты
+                const scale = padding.scale;
+                const padX = padding.x;
+                const padY = padding.y;
+                
+                let x1_orig = (x1 - padX) / scale;
+                let y1_orig = (y1 - padY) / scale;
+                let x2_orig = (x2 - padX) / scale;
+                let y2_orig = (y2 - padY) / scale;
+                
+                // Обрезаем по границам изображения
+                x1_orig = Math.max(0, x1_orig);
+                y1_orig = Math.max(0, y1_orig);
+                x2_orig = Math.min(image.naturalWidth, x2_orig);
+                y2_orig = Math.min(image.naturalHeight, y2_orig);
+                
+                const width = x2_orig - x1_orig;
+                const height = y2_orig - y1_orig;
+                
+                if (width > 0 && height > 0) {
+                    detections.push({
+                        x: x1_orig,
+                        y: y1_orig,
+                        width: width,
+                        height: height,
+                        confidence: confidence,
+                        classId: classId
+                    });
+                }
+            }
+        }
+    } else {
+        console.error("Unexpected output format:", dims);
+    }
+    
+    return detections;
+}
+
+function drawResults(detections, originalImage) {
     const preview = document.getElementById('preview');
     const canvas = document.getElementById('canvas');
     const ctx = canvas.getContext('2d');
-    const loading = document.getElementById('loading');
-    const resultsDiv = document.getElementById('results');
     
-    let session = null;
-    let classes = null;
-    let isModelReady = false;
+    canvas.width = preview.offsetWidth;
+    canvas.height = preview.offsetHeight;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
     
-    // Инициализация модели и классов
-    async function init() {
-        showLoading(true, "Initializing WASM runtime...");
-        try {
-            // Инициализация ONNX Runtime
-            await ort.init();
-            
-            // Загрузка классов COCO
-            const response = await fetch('coco_classes.json');
-            classes = await response.json();
-            
-            // Загрузка модели YOLOv8n
-            showLoading(true, "Loading YOLOv8n model...");
-            session = await ort.InferenceSession.create(
-                './model/yolov8n.onnx', 
-                { executionProviders: ['wasm'] }
-            );
-            
-            isModelReady = true;
-            showLoading(false);
-            console.log("Model and WASM runtime initialized");
-        } catch (error) {
-            console.error("Initialization failed:", error);
-            showLoading(false, `Error: ${error.message}`);
-        }
-    }
-
-    // Показать/скрыть загрузку
-    function showLoading(show, message = "Processing...") {
-        loading.textContent = message;
-        loading.style.display = show ? 'block' : 'none';
-    }
-
-    // Обработка загрузки изображения
-    imageUpload.addEventListener('change', async (e) => {
-        if (!e.target.files || !e.target.files[0]) return;
+    const scaleX = canvas.width / originalImage.naturalWidth;
+    const scaleY = canvas.height / originalImage.naturalHeight;
+    
+    detections.forEach(det => {
+        const x = det.x * scaleX;
+        const y = det.y * scaleY;
+        const width = det.width * scaleX;
+        const height = det.height * scaleY;
         
-        const file = e.target.files[0];
-        const reader = new FileReader();
+        const color = colors[det.classId % colors.length];
         
-        reader.onload = async (event) => {
-            // Отображаем превью
-            preview.src = event.target.result;
-            
-            preview.onload = async () => {
-                if (!isModelReady) {
-                    showLoading(true, "Model not ready, initializing...");
-                    await init();
-                }
-                
-                try {
-                    showLoading(true, "Detecting objects...");
-                    
-                    // Обработка изображения
-                    const { inputTensor, xRatio, yRatio } = preprocessImage(preview);
-                    
-                    // Выполнение вывода
-                    const output = await runInference(inputTensor);
-                    
-                    // Обработка результатов
-                    const detections = processOutput(output, preview, xRatio, yRatio);
-                    
-                    // Отрисовка результатов
-                    drawDetections(detections);
-                    displayResults(detections);
-                    
-                    showLoading(false);
-                } catch (error) {
-                    console.error("Detection error:", error);
-                    showLoading(false, `Detection failed: ${error.message}`);
-                }
-            };
-        };
+        // Рисуем bounding box
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x, y, width, height);
         
-        reader.readAsDataURL(file);
+        // Рисуем фон для текста
+        const className = classNames[det.classId] || `Class ${det.classId}`;
+        const label = `${className} ${(det.confidence * 100).toFixed(1)}%`;
+        
+        ctx.fillStyle = color;
+        ctx.font = 'bold 14px Arial';
+        const textWidth = ctx.measureText(label).width;
+        const textHeight = 20;
+        
+        // Проверяем, чтобы текст не выходил за верхнюю границу
+        const textY = y - textHeight < 0 ? y + height : y - 5;
+        
+        ctx.fillRect(x, textY - textHeight + 5, textWidth + 10, textHeight);
+        ctx.fillStyle = 'white';
+        ctx.fillText(label, x + 5, textY);
     });
+}
 
-    // Предварительная обработка изображения
-    function preprocessImage(img) {
-        const modelSize = 640;
-        const channels = 3;
-        
-        // Рассчитываем соотношения сторон
-        const xRatio = img.width / modelSize;
-        const yRatio = img.height / modelSize;
-        
-        // Создаем временный canvas для ресайза
-        const tempCanvas = document.createElement('canvas');
-        tempCanvas.width = modelSize;
-        tempCanvas.height = modelSize;
-        const tempCtx = tempCanvas.getContext('2d');
-        
-        // Рисуем изображение с сохранением пропорций
-        tempCtx.fillStyle = '#121212'; // Цвет фона
-        tempCtx.fillRect(0, 0, modelSize, modelSize);
-        
-        const scale = Math.min(modelSize / img.width, modelSize / img.height);
-        const newWidth = img.width * scale;
-        const newHeight = img.height * scale;
-        const xOffset = (modelSize - newWidth) / 2;
-        const yOffset = (modelSize - newHeight) / 2;
-        
-        tempCtx.drawImage(
-            img, 
-            0, 0, img.width, img.height,
-            xOffset, yOffset, newWidth, newHeight
-        );
-        
-        // Получаем данные изображения
-        const imageData = tempCtx.getImageData(0, 0, modelSize, modelSize);
-        
-        // Преобразуем в тензор (нормализация 0-1, формат CHW)
-        const inputData = new Float32Array(channels * modelSize * modelSize);
-        for (let i = 0; i < imageData.data.length; i += 4) {
-            const pixelIndex = i / 4;
-            inputData[pixelIndex] = imageData.data[i] / 255;       // R
-            inputData[pixelIndex + modelSize * modelSize] = imageData.data[i + 1] / 255; // G
-            inputData[pixelIndex + 2 * modelSize * modelSize] = imageData.data[i + 2] / 255; // B
-        }
-        
-        return {
-            inputTensor: new ort.Tensor('float32', inputData, [1, channels, modelSize, modelSize]),
-            xRatio,
-            yRatio
-        };
+function showResults(detections, inferenceTime) {
+    const resultsContainer = document.getElementById('results');
+    
+    if (detections.length === 0) {
+        resultsContainer.innerHTML = '<div class="detection-item">No objects detected</div>';
+        return;
     }
-
-    // Выполнение вывода модели
-    async function runInference(inputTensor) {
-        const feeds = { 
-            images: inputTensor 
-        };
+    
+    let html = `
+        <div class="detection-item">
+            <div class="detection-info" style="font-weight:bold">
+                Detected ${detections.length} objects in ${inferenceTime.toFixed(1)}ms
+            </div>
+        </div>
+    `;
+    
+    detections.forEach(det => {
+        const className = classNames[det.classId] || `Class ${det.classId}`;
+        const color = colors[det.classId % colors.length];
         
-        const results = await session.run(feeds);
-        return results.output0.data;
-    }
-
-    // Обработка выходных данных модели
-    function processOutput(output, img, xRatio, yRatio) {
-        const detections = [];
-        const outputSize = 84; // 4 bbox + 80 classes
-        const numDetections = output.length / outputSize;
-        
-        for (let i = 0; i < numDetections; i++) {
-            const offset = i * outputSize;
-            
-            // Извлекаем параметры bbox
-            const xc = output[offset];
-            const yc = output[offset + 1];
-            const w = output[offset + 2];
-            const h = output[offset + 3];
-            
-            // Рассчитываем координаты
-            const x1 = (xc - w / 2) * xRatio;
-            const y1 = (yc - h / 2) * yRatio;
-            const x2 = (xc + w / 2) * xRatio;
-            const y2 = (yc + h / 2) * yRatio;
-            const width = x2 - x1;
-            const height = y2 - y1;
-            
-            // Находим класс с максимальной уверенностью
-            let maxProb = -1;
-            let classId = -1;
-            for (let j = 4; j < 84; j++) {
-                const prob = output[offset + j];
-                if (prob > maxProb) {
-                    maxProb = prob;
-                    classId = j - 4;
-                }
-            }
-            
-            // Применяем сигмоиду для получения вероятности
-            const confidence = 1 / (1 + Math.exp(-maxProb));
-            
-            if (confidence > 0.5 && classId in classes) {
-                detections.push({
-                    bbox: [x1, y1, width, height],
-                    classId,
-                    className: classes[classId],
-                    confidence,
-                    color: `hsl(${(classId * 137) % 360}, 80%, 60%)`
-                });
-            }
-        }
-        
-        // Применяем Non-Maximum Suppression (NMS)
-        return applyNMS(detections, 0.45);
-    }
-
-    // Non-Maximum Suppression
-    function applyNMS(detections, iouThreshold) {
-        detections.sort((a, b) => b.confidence - a.confidence);
-        
-        const finalDetections = [];
-        while (detections.length > 0) {
-            const current = detections.shift();
-            finalDetections.push(current);
-            
-            for (let i = detections.length - 1; i >= 0; i--) {
-                if (current.classId !== detections[i].classId) continue;
-                
-                const iou = calculateIOU(current.bbox, detections[i].bbox);
-                if (iou > iouThreshold) {
-                    detections.splice(i, 1);
-                }
-            }
-        }
-        
-        return finalDetections;
-    }
-
-    // Расчет Intersection over Union (IoU)
-    function calculateIOU(box1, box2) {
-        const [x1, y1, w1, h1] = box1;
-        const [x2, y2, w2, h2] = box2;
-        
-        const interX1 = Math.max(x1, x2);
-        const interY1 = Math.max(y1, y2);
-        const interX2 = Math.min(x1 + w1, x2 + w2);
-        const interY2 = Math.min(y1 + h1, y2 + h2);
-        
-        const interArea = Math.max(0, interX2 - interX1) * Math.max(0, interY2 - interY1);
-        const box1Area = w1 * h1;
-        const box2Area = w2 * h2;
-        
-        return interArea / (box1Area + box2Area - interArea);
-    }
-
-    // Отрисовка обнаруженных объектов
-    function drawDetections(detections) {
-        // Настройка canvas
-        canvas.width = preview.width;
-        canvas.height = preview.height;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        
-        // Рисуем каждый обнаруженный объект
-        detections.forEach(det => {
-            const [x, y, width, height] = det.bbox;
-            
-            // Рисуем bounding box
-            ctx.strokeStyle = det.color;
-            ctx.lineWidth = 2;
-            ctx.strokeRect(x, y, width, height);
-            
-            // Рисуем фон для текста
-            ctx.fillStyle = det.color;
-            const text = `${det.className} ${(det.confidence * 100).toFixed(1)}%`;
-            const textWidth = ctx.measureText(text).width;
-            
-            ctx.fillRect(
-                x - 1,
-                y - 20,
-                textWidth + 10,
-                20
-            );
-            
-            // Рисуем текст
-            ctx.fillStyle = 'white';
-            ctx.font = '14px Arial';
-            ctx.textBaseline = 'top';
-            ctx.fillText(text, x + 4, y - 18);
-        });
-    }
-
-    // Отображение результатов в виде списка
-    function displayResults(detections) {
-        resultsDiv.innerHTML = '';
-        
-        if (detections.length === 0) {
-            resultsDiv.innerHTML = '<div class="detection-item">No objects detected</div>';
-            return;
-        }
-        
-        detections.forEach(det => {
-            const item = document.createElement('div');
-            item.className = 'detection-item';
-            
-            item.innerHTML = `
-                <div class="detection-color" style="background-color: ${det.color}"></div>
-                <div class="detection-info">
-                    ${det.className} - ${(det.confidence * 100).toFixed(1)}%
-                </div>
-            `;
-            
-            resultsDiv.appendChild(item);
-        });
-    }
-
-    // Инициализация при загрузке страницы
-    init();
-});
+        html += `
+        <div class="detection-item">
+            <div class="detection-color" style="background-color: ${color}"></div>
+            <div class="detection-info">
+                ${className} - ${(det.confidence * 100).toFixed(1)}%
+            </div>
+        </div>
+        `;
+    });
+    
+    resultsContainer.innerHTML = html;
+}
